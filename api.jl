@@ -1,50 +1,169 @@
 # api.jl
+#
+# JWT API Authentication Demo (Oxygen.jl)
+# ======================================
+
 using Oxygen
-using JSONWebTokens
 using HTTP
 using Dates
-using LibPQ
 using SHA
 using JSON3
+using StructTypes
+using JSONWebTokens
+using LibPQ
+using LibPQ: columntable
 
-println("🚀 Starting JWT API Server...")
+# Request body struct for /admin/issue-token (enables Swagger schema generation)
+Base.@kwdef struct IssueTokenRequest
+    client_id::String
+    client_name::String
+    expires_in_days::Int = 365
+end
+StructTypes.StructType(::Type{IssueTokenRequest}) = StructTypes.Struct()
 
-# Configuration from environment variables
+####################################
+# CONFIGURATION                    #
+####################################
+
 const DB_HOST = get(ENV, "DB_HOST", "localhost")
 const DB_PORT = get(ENV, "DB_PORT", "5432")
 const DB_NAME = get(ENV, "DB_NAME", "jwt_api_db")
 const DB_USER = get(ENV, "DB_USER", "api_user")
 const DB_PASSWORD = get(ENV, "DB_PASSWORD", "password")
+
 const JWT_SECRET = get(ENV, "JWT_SECRET", "change-me-in-production")
 const API_PORT = parse(Int, get(ENV, "API_PORT", "8080"))
 
-# Database connection string
+# Demo behavior: admin endpoints are intentionally unprotected for Swagger token issuance.
+# If you want an additional safety latch, set this to true and require env enablement.
+const DEMO_UNSAFE_ADMIN = lowercase(get(ENV, "DEMO_UNSAFE_ADMIN", "true")) == "true"
+
 const DB_CONN_STRING = "host=$DB_HOST port=$DB_PORT dbname=$DB_NAME user=$DB_USER password=$DB_PASSWORD"
 
-# Global database connection
+# Never print passwords in logs; print safe connection metadata.
+println("DB: host=$(DB_HOST) port=$(DB_PORT) dbname=$(DB_NAME) user=$(DB_USER)")
+
+# Global DB connection (demo). Production: pool/PgBouncer.
 DB_CONN = nothing
 
+####################################
+# DB CONNECTION                    #
+####################################
+
 function init_db_connection()
-    """Initialize database connection with retry logic"""
     max_retries = 5
     retry_delay = 2
 
     for attempt in 1:max_retries
         try
-            println("📊 Connecting to database (attempt $attempt/$max_retries)...")
+            println("Connecting to database (attempt $attempt/$max_retries)...")
             global DB_CONN = LibPQ.Connection(DB_CONN_STRING)
-            println("✅ Database connected successfully!")
+            println("Database connected successfully!")
             return true
         catch e
-            println("❌ Database connection failed: $e")
+            println("Database connection failed: $e")
             if attempt < max_retries
-                println("⏳ Retrying in $retry_delay seconds...")
+                println("Retrying in $retry_delay seconds...")
                 sleep(retry_delay)
             else
-                println("💥 Failed to connect to database after $max_retries attempts")
+                println("Failed to connect to database after $max_retries attempts")
                 return false
             end
         end
+    end
+    return false
+end
+
+atexit(() -> begin
+    if DB_CONN !== nothing
+        try
+            close(DB_CONN)
+        catch
+            # ignore
+        end
+    end
+end)
+
+####################################
+# TIME UTILITIES (UTC)             #
+####################################
+
+utcnow() = Dates.now(Dates.UTC)
+
+function unix2datetime_utc(unix_seconds::Real)
+    # Dates.unix2datetime returns DateTime; treat as UTC for demo.
+    return Dates.unix2datetime(unix_seconds)
+end
+
+####################################
+# SECURITY UTILITIES               #
+####################################
+
+function getheader(headers, key::AbstractString, default="")
+    for (k, v) in headers
+        if lowercase(String(k)) == lowercase(key)
+            return v
+        end
+    end
+    return default
+end
+
+function get_client_ip(req::HTTP.Request)
+    xff = getheader(req.headers, "X-Forwarded-For", "")
+    if !isempty(xff)
+        return strip(split(xff, ",")[1])
+    end
+    xri = getheader(req.headers, "X-Real-IP", "")
+    return isempty(xri) ? "unknown" : xri
+end
+
+function merge_context!(req::HTTP.Request, additions::Dict{String,Any})
+    if req.context === nothing
+        req.context = additions
+        return
+    end
+    for (k, v) in additions
+        req.context[k] = v
+    end
+end
+
+function get_client_info(req::HTTP.Request)
+    if req.context !== nothing && haskey(req.context, "client_id")
+        return Dict(
+            "client_id" => req.context["client_id"],
+            "client_name" => req.context["client_name"]
+        )
+    end
+    return nothing
+end
+
+####################################
+# RATE LIMITING (DEMO)             #
+####################################
+
+const RATE_LIMIT_STORE = Dict{String, Vector{Float64}}()
+const RATE_LIMIT_WINDOW = 60.0
+const RATE_LIMIT_MAX_REQUESTS = 100
+const RL_LOCK = ReentrantLock()
+
+function check_rate_limit(client_id::String)
+    nowt = time()
+    lock(RL_LOCK)
+    try
+        if !haskey(RATE_LIMIT_STORE, client_id)
+            RATE_LIMIT_STORE[client_id] = Float64[]
+        end
+        filter!(t -> (nowt - t) < RATE_LIMIT_WINDOW, RATE_LIMIT_STORE[client_id])
+
+        if length(RATE_LIMIT_STORE[client_id]) >= RATE_LIMIT_MAX_REQUESTS
+            return false, 0, RATE_LIMIT_WINDOW
+        end
+
+        push!(RATE_LIMIT_STORE[client_id], nowt)
+        remaining = RATE_LIMIT_MAX_REQUESTS - length(RATE_LIMIT_STORE[client_id])
+        return true, remaining, RATE_LIMIT_WINDOW
+    finally
+        unlock(RL_LOCK)
     end
 end
 
@@ -52,14 +171,10 @@ end
 # DATABASE FUNCTIONS               #
 ####################################
 
-function hash_token(token::String)
-    """Create SHA-256 hash of token"""
-    return bytes2hex(sha256(token))
-end
+hash_token(token::String) = bytes2hex(sha256(token))
 
 function save_token_to_db(client_id::String, client_name::String, token::String,
                           expires_at::DateTime, created_by::String)
-    """Save issued token to database"""
     token_hash = hash_token(token)
 
     query = """
@@ -71,23 +186,15 @@ function save_token_to_db(client_id::String, client_name::String, token::String,
             token_hash = EXCLUDED.token_hash,
             expires_at = EXCLUDED.expires_at,
             issued_at = NOW(),
-            active = true
+            active = true,
+            created_by = EXCLUDED.created_by
         RETURNING id
     """
 
-    result = execute(DB_CONN, query, [
-        client_id,
-        client_name,
-        token_hash,
-        expires_at,
-        created_by
-    ])
-
-    return result
+    execute(DB_CONN, query, [client_id, client_name, token_hash, expires_at, created_by])
 end
 
 function validate_token_in_db(token::String)
-    """Validate token exists and is active in database"""
     token_hash = hash_token(token)
 
     query = """
@@ -97,58 +204,76 @@ function validate_token_in_db(token::String)
     """
 
     result = execute(DB_CONN, query, [token_hash])
-
-    if isempty(result)
+    if LibPQ.num_rows(result) == 0
         return nothing
     end
 
-    row = result[1]
+    data = columntable(result)
+    client_id = data.client_id[1]
+    client_name = data.client_name[1]
+    expires_at = data.expires_at[1]
+    active = data.active[1]
 
-    if !row[:active]
-        @warn "Token is revoked" client_id=row[:client_id]
+    if !active
+        @warn "Token is revoked" client_id=client_id
         return nothing
     end
 
-    if row[:expires_at] < now()
-        @warn "Token is expired" client_id=row[:client_id]
+    # Demo assumes UTC-ish behavior. Production: timestamptz and UTC everywhere.
+    if expires_at < utcnow()
+        @warn "Token is expired" client_id=client_id
         return nothing
     end
 
-    # Update last_used_at
-    update_query = """
-        UPDATE api_tokens
-        SET last_used_at = NOW()
-        WHERE token_hash = \$1
-    """
-    execute(DB_CONN, update_query, [token_hash])
+    execute(DB_CONN, "UPDATE api_tokens SET last_used_at = NOW() WHERE token_hash = \$1", [token_hash])
 
-    return Dict(
-        "client_id" => row[:client_id],
-        "client_name" => row[:client_name]
-    )
+    return Dict("client_id" => client_id, "client_name" => client_name)
 end
 
 function revoke_token(client_id::String)
-    """Revoke a token"""
     query = """
         UPDATE api_tokens
         SET active = false
         WHERE client_id = \$1
-        RETURNING client_id, client_name
+        RETURNING client_id
     """
-
     result = execute(DB_CONN, query, [client_id])
-    return !isempty(result)
+    return LibPQ.num_rows(result) > 0
+end
+
+function get_all_tokens()
+    query = """
+        SELECT
+            client_id, client_name, active,
+            issued_at, expires_at, last_used_at, created_by
+        FROM api_tokens
+        ORDER BY issued_at DESC
+    """
+    result = execute(DB_CONN, query)
+    if LibPQ.num_rows(result) == 0
+        return []
+    end
+    data = columntable(result)
+
+    return [
+        Dict(
+            "client_id" => data.client_id[i],
+            "client_name" => data.client_name[i],
+            "active" => data.active[i],
+            "issued_at" => string(data.issued_at[i]),
+            "expires_at" => string(data.expires_at[i]),
+            "last_used_at" => ismissing(data.last_used_at[i]) ? nothing : string(data.last_used_at[i]),
+            "created_by" => data.created_by[i]
+        ) for i in 1:length(data.client_id)
+    ]
 end
 
 function log_token_usage(client_id::String, endpoint::String, method::String,
-                        status_code::Int, ip_address::String="unknown")
-    """Log API usage"""
+                         status_code::Int, ip_address::String="unknown")
     query = """
         INSERT INTO token_usage_log (client_id, endpoint, method, status_code, ip_address)
         VALUES (\$1, \$2, \$3, \$4, \$5)
     """
-
     try
         execute(DB_CONN, query, [client_id, endpoint, method, status_code, ip_address])
     catch e
@@ -156,49 +281,16 @@ function log_token_usage(client_id::String, endpoint::String, method::String,
     end
 end
 
-function get_all_tokens()
-    """Get all issued tokens"""
-    query = """
-        SELECT
-            client_id,
-            client_name,
-            active,
-            issued_at,
-            expires_at,
-            last_used_at,
-            created_by
-        FROM api_tokens
-        ORDER BY issued_at DESC
-    """
-
-    result = execute(DB_CONN, query)
-
-    return [
-        Dict(
-            "client_id" => row[:client_id],
-            "client_name" => row[:client_name],
-            "active" => row[:active],
-            "issued_at" => string(row[:issued_at]),
-            "expires_at" => string(row[:expires_at]),
-            "last_used_at" => row[:last_used_at] === missing ? nothing : string(row[:last_used_at]),
-            "created_by" => row[:created_by]
-        )
-        for row in result
-    ]
-end
-
 ####################################
 # JWT FUNCTIONS                    #
 ####################################
 
-function generate_api_jwt(client_id::String, client_name::String; expires_in_days::Int=365)
-    """Generate JWT token"""
+function generate_api_jwt(client_id::String; expires_in_days::Int=365)
     now_unix = time()
     expires_unix = now_unix + (expires_in_days * 86400)
 
     claims = Dict(
         "sub" => client_id,
-        "client_name" => client_name,
         "type" => "api_access",
         "iat" => now_unix,
         "exp" => expires_unix,
@@ -207,84 +299,167 @@ function generate_api_jwt(client_id::String, client_name::String; expires_in_day
 
     encoding = JSONWebTokens.HS256(JWT_SECRET)
     token = JSONWebTokens.encode(encoding, claims)
-
-    # Convert Unix timestamp to DateTime
-    expires_at = unix2datetime(expires_unix)
-
+    expires_at = unix2datetime_utc(expires_unix)
     return token, expires_at
 end
 
 function validate_api_jwt(token::String)
-    """Validate JWT and check database"""
     try
-        # Validate JWT signature
         encoding = JSONWebTokens.HS256(JWT_SECRET)
         claims = JSONWebTokens.decode(encoding, token)
 
-        if claims["exp"] < time()
+        if Float64(claims["exp"]) < time()
             return nothing
         end
-
         if get(claims, "type", "") != "api_access"
             return nothing
         end
 
-        # Check database
+        # DB is authoritative for revocation + client metadata
         db_info = validate_token_in_db(token)
         if db_info === nothing
             return nothing
         end
 
         return merge(claims, db_info)
-
     catch e
         @error "JWT validation failed" exception=e
         return nothing
     end
 end
 
+function hard_delete_token(client_id::String)::Bool
+    println("DEBUG: Attempting to delete client_id='$client_id'")
+
+    # Check if record exists first
+    check = execute(DB_CONN, "SELECT client_id FROM api_tokens WHERE client_id = \$1", [client_id])
+    println("DEBUG: Found $(LibPQ.num_rows(check)) records before delete")
+
+    if LibPQ.num_rows(check) == 0
+        return false
+    end
+
+    # Delete it
+    execute(DB_CONN, "DELETE FROM api_tokens WHERE client_id = \$1", [client_id])
+
+    # Verify it's gone
+    verify = execute(DB_CONN, "SELECT client_id FROM api_tokens WHERE client_id = \$1", [client_id])
+    println("DEBUG: Found $(LibPQ.num_rows(verify)) records after delete")
+
+    return LibPQ.num_rows(verify) == 0
+end
+
+
+
 ####################################
 # MIDDLEWARE                       #
 ####################################
 
+const UNPROTECTED_PREFIXES = ("/health", "/docs", "/openapi", "/swagger")
+
 function JWTAuthMiddleware(handler)
     return function(req::HTTP.Request)
-        auth_header = get(req.headers, "Authorization", "")
+        # Docs + health must be reachable without auth (Swagger must load schema).
+        for prefix in UNPROTECTED_PREFIXES
+            if startswith(req.target, prefix)
+                return handler(req)
+            end
+        end
 
-        if !startswith(auth_header, "Bearer ")
-            return HTTP.Response(401, JSON3.write(Dict(
-                "error" => "Missing Bearer token"
+        # Admin endpoints remain unprotected for the demo, but can be disabled with a latch.
+        if startswith(req.target, "/admin")
+            if !DEMO_UNSAFE_ADMIN
+                return HTTP.Response(403, ["Content-Type" => "application/json"], JSON3.write(Dict(
+                    "error" => "admin_disabled",
+                    "error_description" => "Admin endpoints are disabled. Set DEMO_UNSAFE_ADMIN=true for demo mode."
+                )))
+            end
+            return handler(req)
+        end
+
+        # All /api/* requires Bearer token
+        auth_header = getheader(req.headers, "Authorization", "")
+        if isempty(auth_header)
+            return HTTP.Response(401, [
+                "Content-Type" => "application/json",
+                "WWW-Authenticate" => "Bearer realm=\"API\""
+            ], JSON3.write(Dict(
+                "error" => "missing_token",
+                "error_description" => "No Authorization header provided"
             )))
         end
 
-        token = replace(auth_header, "Bearer " => "", count=1)
+        if !startswith(auth_header, "Bearer ")
+            return HTTP.Response(401, [
+                "Content-Type" => "application/json",
+                "WWW-Authenticate" => "Bearer realm=\"API\""
+            ], JSON3.write(Dict(
+                "error" => "invalid_token_format",
+                "error_description" => "Authorization header must use Bearer scheme"
+            )))
+        end
+
+        token = strip(replace(auth_header, "Bearer " => "", count=1))
+        if isempty(token)
+            return HTTP.Response(401, [
+                "Content-Type" => "application/json",
+                "WWW-Authenticate" => "Bearer realm=\"API\""
+            ], JSON3.write(Dict(
+                "error" => "empty_token",
+                "error_description" => "Bearer token is empty"
+            )))
+        end
 
         claims = validate_api_jwt(token)
         if claims === nothing
-            return HTTP.Response(401, JSON3.write(Dict(
-                "error" => "Invalid or expired token"
+            return HTTP.Response(401, [
+                "Content-Type" => "application/json",
+                "WWW-Authenticate" => "Bearer realm=\"API\", error=\"invalid_token\""
+            ], JSON3.write(Dict(
+                "error" => "invalid_token",
+                "error_description" => "Token is invalid, expired, or revoked"
             )))
         end
 
-        # Get client IP
-        ip_address = get(req.headers, "X-Forwarded-For",
-                        get(req.headers, "X-Real-IP", "unknown"))
+        client_id = claims["client_id"]
+        client_name = claims["client_name"]
 
-        # Log usage (async)
-        @async log_token_usage(
-            claims["client_id"],
-            req.target,
-            req.method,
-            200,
-            ip_address
-        )
+        allowed, remaining, window = check_rate_limit(client_id)
+        if !allowed
+            return HTTP.Response(429, [
+                "Content-Type" => "application/json",
+                "X-RateLimit-Limit" => string(RATE_LIMIT_MAX_REQUESTS),
+                "X-RateLimit-Remaining" => "0",
+                "X-RateLimit-Reset" => string(Int(time() + window)),
+                "Retry-After" => string(Int(window))
+            ], JSON3.write(Dict(
+                "error" => "rate_limit_exceeded",
+                "error_description" => "Too many requests. Limit: $RATE_LIMIT_MAX_REQUESTS per $(Int(window)) seconds"
+            )))
+        end
 
-        req.context = Dict(
-            "client_id" => claims["client_id"],
-            "client_name" => claims["client_name"]
-        )
+        ip = get_client_ip(req)
+        merge_context!(req, Dict(
+            "client_id" => client_id,
+            "client_name" => client_name,
+            "ip_address" => ip,
+            "authenticated" => true
+        ))
 
-        return handler(req)
+        resp = handler(req)
+
+        if resp isa HTTP.Response
+            push!(resp.headers,
+                "X-RateLimit-Limit" => string(RATE_LIMIT_MAX_REQUESTS),
+                "X-RateLimit-Remaining" => string(remaining),
+                "X-RateLimit-Reset" => string(Int(time() + window))
+            )
+        end
+
+        status = resp isa HTTP.Response ? resp.status : 200
+        @async log_token_usage(client_id, req.target, req.method, status, ip)
+
+        return resp
     end
 end
 
@@ -292,7 +467,6 @@ end
 # ROUTES                           #
 ####################################
 
-# Health check
 @get "/health" function()
     db_status = try
         execute(DB_CONN, "SELECT 1")
@@ -303,135 +477,412 @@ end
 
     return Dict(
         "status" => "ok",
-        "timestamp" => now(),
-        "database" => db_status
+        "timestamp_utc" => string(utcnow()),
+        "database" => db_status,
+        "demo_unsafe_admin" => DEMO_UNSAFE_ADMIN
     )
 end
 
-# Issue new token (admin endpoint)
 @post "/admin/issue-token" function(req::HTTP.Request)
-    body = JSON3.read(req.body)
+    if !DEMO_UNSAFE_ADMIN
+        return HTTP.Response(403, ["Content-Type" => "application/json"], JSON3.write(Dict(
+            "error" => "admin_disabled",
+            "error_description" => "Set DEMO_UNSAFE_ADMIN=true to use demo admin endpoints."
+        )))
+    end
 
-    client_id = get(body, :client_id, "")
-    client_name = get(body, :client_name, "")
-    expires_in_days = get(body, :expires_in_days, 365)
-    created_by = get(body, :created_by, "admin")
+    body = try
+        JSON3.read(req.body)
+    catch e
+        return HTTP.Response(400, ["Content-Type" => "application/json"], JSON3.write(Dict(
+            "error" => "invalid_json",
+            "error_description" => "Request body must be valid JSON"
+        )))
+    end
+
+    client_id = string(get(body, :client_id, get(body, "client_id", "")))
+    client_name = string(get(body, :client_name, get(body, "client_name", "")))
+    expires_in_days = get(body, :expires_in_days, get(body, "expires_in_days", 365))
 
     if isempty(client_id) || isempty(client_name)
-        return HTTP.Response(400, JSON3.write(Dict(
-            "error" => "client_id and client_name required"
+        return HTTP.Response(400, ["Content-Type" => "application/json"], JSON3.write(Dict(
+            "error" => "validation_error",
+            "error_description" => "client_id and client_name are required"
         )))
     end
 
-    try
-        token, expires_at = generate_api_jwt(client_id, client_name,
-                                            expires_in_days=expires_in_days)
+    token, expires_at = generate_api_jwt(client_id, expires_in_days=expires_in_days)
 
-        save_token_to_db(client_id, client_name, token, expires_at, created_by)
+    # demo creator identity
+    created_by = "demo-admin"
+    save_token_to_db(client_id, client_name, token, expires_at, created_by)
 
-        return Dict(
-            "success" => true,
-            "client_id" => client_id,
-            "client_name" => client_name,
-            "token" => token,
-            "token_type" => "Bearer",
-            "expires_in_days" => expires_in_days,
-            "expires_at" => string(expires_at),
-            "usage" => "Authorization: Bearer <token>"
-        )
-
-    catch e
-        @error "Failed to issue token" exception=e
-        return HTTP.Response(500, JSON3.write(Dict(
-            "error" => "Failed to issue token"
-        )))
-    end
+    return HTTP.Response(200, ["Content-Type" => "application/json"], JSON3.write(Dict(
+        "success" => true,
+        "client_id" => client_id,
+        "client_name" => client_name,
+        "token" => token,
+        "token_type" => "Bearer",
+        "expires_in_days" => expires_in_days,
+        "expires_at_utc" => string(expires_at),
+        "usage" => "Authorization: Bearer <token>"
+    )))
 end
 
-# List all tokens
 @get "/admin/tokens" function()
-    try
-        tokens = get_all_tokens()
-        return Dict("tokens" => tokens)
-    catch e
-        @error "Failed to fetch tokens" exception=e
-        return HTTP.Response(500, JSON3.write(Dict(
-            "error" => "Failed to fetch tokens"
+    if !DEMO_UNSAFE_ADMIN
+        return HTTP.Response(403, ["Content-Type" => "application/json"], JSON3.write(Dict(
+            "error" => "admin_disabled",
+            "error_description" => "Set DEMO_UNSAFE_ADMIN=true to use demo admin endpoints."
+        )))
+    end
+    return Dict("tokens" => get_all_tokens())
+end
+
+@delete "/admin/tokens/*" function(req::HTTP.Request)
+    if !DEMO_UNSAFE_ADMIN
+        return HTTP.Response(403, ["Content-Type" => "application/json"], JSON3.write(Dict(
+            "error" => "admin_disabled",
+            "error_description" => "Set DEMO_UNSAFE_ADMIN=true to use demo admin endpoints."
+        )))
+    end
+
+    # Extract client_id from URL: /admin/tokens/{client_id}
+    parts = split(req.target, "/")
+    client_id = String(HTTP.URIs.unescapeuri(parts[end]))
+
+    if isempty(client_id)
+        return HTTP.Response(400, ["Content-Type" => "application/json"], JSON3.write(Dict(
+            "error" => "missing_client_id",
+            "error_description" => "client_id is required"
+        )))
+    end
+
+    deleted = hard_delete_token(client_id)
+    if deleted
+        return Dict("success" => true, "message" => "Token deleted", "client_id" => client_id)
+    else
+        return HTTP.Response(404, ["Content-Type" => "application/json"], JSON3.write(Dict(
+            "error" => "not_found",
+            "error_description" => "Token not found"
         )))
     end
 end
 
-# Revoke token
-@delete "/admin/tokens/:client_id" function(req::HTTP.Request, client_id::String)
-    try
-        revoked = revoke_token(client_id)
-
-        if revoked
-            return Dict(
-                "success" => true,
-                "message" => "Token revoked",
-                "client_id" => client_id
-            )
-        else
-            return HTTP.Response(404, JSON3.write(Dict(
-                "error" => "Token not found"
-            )))
-        end
-    catch e
-        return HTTP.Response(500, JSON3.write(Dict(
-            "error" => "Failed to revoke token"
+@patch "/admin/tokens/:client_id/revoke" function(req::HTTP.Request, client_id::String)
+    if !DEMO_UNSAFE_ADMIN
+        return HTTP.Response(403, ["Content-Type" => "application/json"], JSON3.write(Dict(
+            "error" => "admin_disabled",
+            "error_description" => "Set DEMO_UNSAFE_ADMIN=true to use demo admin endpoints."
         )))
     end
+
+    revoked = revoke_token(client_id)
+    if revoked
+        return Dict("success" => true, "message" => "Token revoked", "client_id" => client_id)
+    end
+    return HTTP.Response(404, ["Content-Type" => "application/json"], JSON3.write(Dict(
+        "error" => "not_found",
+        "error_description" => "Token not found"
+    )))
 end
 
-# Get usage stats
 @get "/admin/usage/:client_id" function(req::HTTP.Request, client_id::String)
+    if !DEMO_UNSAFE_ADMIN
+        return HTTP.Response(403, ["Content-Type" => "application/json"], JSON3.write(Dict(
+            "error" => "admin_disabled",
+            "error_description" => "Set DEMO_UNSAFE_ADMIN=true to use demo admin endpoints."
+        )))
+    end
+
     query = """
-        SELECT
-            DATE(timestamp) as date,
-            COUNT(*) as request_count,
-            COUNT(DISTINCT endpoint) as unique_endpoints
+        SELECT DATE(timestamp) as date,
+               COUNT(*) as request_count,
+               COUNT(DISTINCT endpoint) as unique_endpoints
         FROM token_usage_log
         WHERE client_id = \$1
-        AND timestamp > NOW() - INTERVAL '30 days'
+          AND timestamp > NOW() - INTERVAL '30 days'
         GROUP BY DATE(timestamp)
         ORDER BY date DESC
     """
 
     result = execute(DB_CONN, query, [client_id])
+    if LibPQ.num_rows(result) == 0
+        return Dict("client_id" => client_id, "usage" => [])
+    end
 
+    data = columntable(result)
     usage = [
         Dict(
-            "date" => string(row[:date]),
-            "request_count" => row[:request_count],
-            "unique_endpoints" => row[:unique_endpoints]
-        )
-        for row in result
+            "date" => string(data.date[i]),
+            "request_count" => data.request_count[i],
+            "unique_endpoints" => data.unique_endpoints[i]
+        ) for i in 1:length(data.date)
     ]
-
     return Dict("client_id" => client_id, "usage" => usage)
 end
 
-# Protected endpoints
 @get "/api/data" function(req::HTTP.Request)
-    return Dict(
-        "data" => [
-            Dict("id" => 1, "value" => "Item 1"),
-            Dict("id" => 2, "value" => "Item 2")
-        ],
-        "requested_by" => req.context["client_name"]
-    )
+    client = get_client_info(req)
+    data = [
+        Dict("id" => 1, "value" => "Item 1", "owner" => client["client_id"]),
+        Dict("id" => 2, "value" => "Item 2", "owner" => client["client_id"])
+    ]
+    return Dict("success" => true, "data" => data, "client" => client)
 end
 
 @post "/api/data" function(req::HTTP.Request)
-    body = JSON3.read(req.body)
+    client = get_client_info(req)
+
+    body = try
+        JSON3.read(req.body)
+    catch e
+        return HTTP.Response(400, ["Content-Type" => "application/json"], JSON3.write(Dict(
+            "error" => "invalid_json",
+            "error_description" => "Request body must be valid JSON",
+            "client" => client
+        )))
+    end
+
+    has_value = haskey(body, :value) || haskey(body, "value")
+    if !has_value
+        return HTTP.Response(400, ["Content-Type" => "application/json"], JSON3.write(Dict(
+            "error" => "validation_error",
+            "error_description" => "Missing required field: value",
+            "client" => client
+        )))
+    end
+
+    value = get(body, :value, get(body, "value", nothing))
+    if value === nothing || (value isa String && isempty(strip(value)))
+        return HTTP.Response(400, ["Content-Type" => "application/json"], JSON3.write(Dict(
+            "error" => "validation_error",
+            "error_description" => "Field value cannot be empty",
+            "client" => client
+        )))
+    end
+
+    resource_id = rand(1000:9999)
+
+    return HTTP.Response(201, [
+        "Content-Type" => "application/json",
+        "Location" => "/api/data/$resource_id"
+    ], JSON3.write(Dict(
+        "success" => true,
+        "resource" => Dict(
+            "id" => resource_id,
+            "value" => value,
+            "owner" => client["client_id"],
+            "created_at_utc" => string(utcnow())
+        ),
+        "client" => client
+    )))
+end
+
+@get "/api/data/:id" function(req::HTTP.Request, id::String)
+    client = get_client_info(req)
+    rid = try
+        parse(Int, id)
+    catch
+        return HTTP.Response(400, ["Content-Type" => "application/json"], JSON3.write(Dict(
+            "error" => "invalid_id",
+            "error_description" => "Resource ID must be a valid integer",
+            "client" => client
+        )))
+    end
 
     return Dict(
-        "message" => "Data created",
-        "id" => rand(1:1000),
-        "data" => body,
-        "created_by" => req.context["client_name"]
+        "success" => true,
+        "resource" => Dict(
+            "id" => rid,
+            "value" => "Sample data for resource $rid",
+            "owner" => client["client_id"],
+            "created_at_utc" => "2026-01-14T10:00:00Z"
+        ),
+        "client" => client
     )
+end
+
+@delete "/api/data/:id" function(req::HTTP.Request, id::String)
+    client = get_client_info(req)
+    rid = try
+        parse(Int, id)
+    catch
+        return HTTP.Response(400, ["Content-Type" => "application/json"], JSON3.write(Dict(
+            "error" => "invalid_id",
+            "error_description" => "Resource ID must be a valid integer",
+            "client" => client
+        )))
+    end
+
+    return Dict("success" => true, "message" => "Resource deleted", "resource_id" => rid, "client" => client)
+end
+
+####################################
+# SWAGGER DOCUMENTATION            #
+####################################
+
+function setup_swagger_docs()
+    mergeschema(Dict(
+        "openapi" => "3.0.0",
+        "info" => Dict(
+            "title" => "JWT API Authentication Demo (Oxygen.jl)",
+            "version" => "1.0.0",
+            "description" => """
+Demonstrates API authentication best practices using JWT bearer tokens.
+
+Demo behavior:
+- /admin/* is intentionally unprotected so you can issue/revoke tokens in Swagger.
+- /api/* requires Bearer JWT and performs DB revocation checks.
+
+Testing flow:
+1) POST /admin/issue-token
+2) Click Authorize and paste the token (no quotes)
+3) Call /api/* endpoints
+            """
+        ),
+        "servers" => [Dict("url" => "http://localhost:8080", "description" => "Local")]
+    ))
+
+    mergeschema(Dict(
+        "components" => Dict(
+            "securitySchemes" => Dict(
+                "bearerAuth" => Dict(
+                    "type" => "http",
+                    "scheme" => "bearer",
+                    "bearerFormat" => "JWT"
+                )
+            ),
+            "schemas" => Dict(
+                "IssueTokenRequest" => Dict(
+                    "type" => "object",
+                    "required" => ["client_id", "client_name"],
+                    "properties" => Dict(
+                        "client_id" => Dict(
+                            "type" => "string",
+                            "description" => "Unique identifier for the client",
+                            "example" => "demo"
+                        ),
+                        "client_name" => Dict(
+                            "type" => "string",
+                            "description" => "Human-readable name for the client",
+                            "example" => "Demo App"
+                        ),
+                        "expires_in_days" => Dict(
+                            "type" => "integer",
+                            "description" => "Token validity in days",
+                            "default" => 365,
+                            "example" => 30
+                        )
+                    )
+                )
+            )
+        ),
+        "security" => [Dict("bearerAuth" => [])]
+    ))
+
+    mergeschema("/health", Dict(
+        "get" => Dict(
+            "tags" => ["System"],
+            "summary" => "Health check",
+            "security" => Any[]
+        )
+    ))
+
+    # Issue-token override (typed request body using $ref)
+    mergeschema("/admin/issue-token", Dict(
+        "post" => Dict(
+            "operationId" => "issueToken",
+            "tags" => ["Admin - Token Management"],
+            "summary" => "Issue a new API token",
+            "description" => "Creates a new JWT token for API access. Requires client_id and client_name.",
+            "security" => Any[],
+            "requestBody" => Dict(
+                "description" => "Token request parameters",
+                "required" => true,
+                "content" => Dict(
+                    "application/json" => Dict(
+                        "schema" => Dict(
+                            "\$ref" => "#/components/schemas/IssueTokenRequest"
+                        )
+                    )
+                )
+            ),
+            "responses" => Dict(
+                "200" => Dict("description" => "Token issued successfully"),
+                "400" => Dict("description" => "Validation error - missing required fields"),
+                "403" => Dict("description" => "Admin endpoints disabled"),
+                "500" => Dict("description" => "Server error")
+            )
+        )
+    ))
+
+    mergeschema("/admin/tokens", Dict(
+        "get" => Dict(
+            "tags" => ["Admin - Token Management"],
+            "summary" => "List tokens (demo admin)",
+            "security" => Any[]
+        )
+    ))
+
+    mergeschema("/admin/tokens/:client_id/revoke", Dict(
+        "patch" => Dict(
+            "tags" => ["Admin - Token Management"],
+            "summary" => "Revoke token (soft disable)",
+            "security" => Any[]
+        )
+    ))
+
+    mergeschema("/admin/usage/:client_id", Dict(
+        "get" => Dict(
+            "tags" => ["Admin - Token Management"],
+            "summary" => "Usage stats (demo admin)",
+            "security" => Any[]
+        )
+    ))
+
+    mergeschema("/admin/tokens/{client_id}", Dict(
+        "delete" => Dict(
+            "tags" => ["Admin - Token Management"],
+            "summary" => "Delete token record",
+            "security" => Any[],
+            "parameters" => [
+                Dict(
+                    "name" => "client_id",
+                    "in" => "path",
+                    "required" => true,
+                    "schema" => Dict("type" => "string"),
+                    "description" => "The client ID to delete"
+                )
+            ]
+        )
+    ))
+
+    mergeschema("/api/data", Dict(
+        "get" => Dict(
+            "tags" => ["Protected API"],
+            "summary" => "Get data (protected)",
+            "security" => [Dict("bearerAuth" => [])]
+        ),
+        "post" => Dict(
+            "tags" => ["Protected API"],
+            "summary" => "Create data (protected)",
+            "security" => [Dict("bearerAuth" => [])]
+        )
+    ))
+
+    mergeschema("/api/data/:id", Dict(
+        "get" => Dict(
+            "tags" => ["Protected API"],
+            "summary" => "Get item (protected)",
+            "security" => [Dict("bearerAuth" => [])]
+        ),
+        "delete" => Dict(
+            "tags" => ["Protected API"],
+            "summary" => "Delete item (protected)",
+            "security" => [Dict("bearerAuth" => [])]
+        )
+    ))
 end
 
 ####################################
@@ -439,18 +890,19 @@ end
 ####################################
 
 function main()
-    # Initialize database connection
     if !init_db_connection()
-        println("💥 Failed to start: Database connection error")
+        println("Failed to start: Database connection error")
         exit(1)
     end
 
-    println("🔐 JWT Secret: $(JWT_SECRET[1:10])... (first 10 chars)")
-    println("🌐 Starting server on port $API_PORT...")
+    println("DEMO_UNSAFE_ADMIN enabled: $DEMO_UNSAFE_ADMIN")
+    println("JWT secret configured (non-default): ", JWT_SECRET != "change-me-in-production")
+    println("Setting up API documentation...")
 
-    # Start server with middleware
+    setup_swagger_docs()
+
+    println("Starting server on port $API_PORT...")
     serve(middleware=[JWTAuthMiddleware], port=API_PORT, host="0.0.0.0")
 end
 
-# Run the server
 main()
