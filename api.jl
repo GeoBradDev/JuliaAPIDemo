@@ -152,25 +152,45 @@ function get_client_ip(req::HTTP.Request)
     return isempty(xri) ? "unknown" : xri
 end
 
-function merge_context!(req::HTTP.Request, additions::Dict{String,Any})
+function merge_context!(req::HTTP.Request, additions::Dict{Symbol,Any})
     if req.context === nothing
-        req.context = additions
-        return
+        req.context = Dict{Symbol,Any}()
     end
+
+    if !(req.context isa Dict{Symbol,Any})
+        ctx = Dict{Symbol,Any}()
+        for (k, v) in req.context
+            if k isa Symbol
+                ctx[k] = v
+            else
+                ctx[Symbol(String(k))] = v
+            end
+        end
+        req.context = ctx
+    end
+
     for (k, v) in additions
         req.context[k] = v
     end
 end
 
+
 function get_client_info(req::HTTP.Request)
-    if req.context !== nothing && haskey(req.context, "client_id")
-        return Dict(
-            "client_id" => req.context["client_id"],
-            "client_name" => req.context["client_name"]
-        )
+    ctx = req.context
+    if ctx === nothing
+        return nothing
     end
+
+    # support either symbol-key or string-key contexts (defensive)
+    if haskey(ctx, :client_id)
+        return Dict("client_id" => ctx[:client_id], "client_name" => ctx[:client_name])
+    elseif haskey(ctx, "client_id")
+        return Dict("client_id" => ctx["client_id"], "client_name" => ctx["client_name"])
+    end
+
     return nothing
 end
+
 
 ####################################
 # RATE LIMITING (DEMO)             #
@@ -332,29 +352,27 @@ function normalize_expires_in_days(body)::Union{Int,Nothing}
 end
 
 function generate_api_jwt(client_id::String; expires_in_days::Union{Int,Nothing}=365)
-    now_unix = time()
+    now_unix = Int(floor(time()))  # integer seconds
 
     claims = Dict(
-        "sub" => client_id,
+        "sub"  => client_id,
         "type" => "api_access",
-        "iat" => now_unix,
-        "iss" => "jwt-api-server"
+        "iat"  => now_unix,
+        "iss"  => "jwt-api-server"
     )
 
-    # DB expiry:
-    # - if expires_in_days is nothing => expires_at = nothing (NULL in DB)
-    # JWT expiry:
-    # - always include exp (predictable), use far-future exp for "non-expiring"
     expires_at = nothing
-
     if expires_in_days !== nothing
-        expires_unix = now_unix + (expires_in_days * 86400)
-        claims["exp"] = expires_unix
-        expires_at = unix2datetime_utc(expires_unix)
+        exp_unix = now_unix + (expires_in_days * 86400)  # still Int
+        claims["exp"] = exp_unix
+        expires_at = Dates.unix2datetime(exp_unix)        # safe now
     else
-        expires_unix = now_unix + (3650 * 86400) # 10 years
-        claims["exp"] = expires_unix
-        expires_at = nothing
+        # if you still want "indefinite", you can either:
+        # A) omit exp entirely (requires you to stop enforcing exp in validate_api_jwt), OR
+        # B) set far-future exp but keep DB expires_at as NULL
+        exp_unix = now_unix + (3650 * 86400)  # 10 years
+        claims["exp"] = exp_unix
+        expires_at = nothing  # DB “never expires”
     end
 
     encoding = JSONWebTokens.HS256(JWT_SECRET)
@@ -362,30 +380,60 @@ function generate_api_jwt(client_id::String; expires_in_days::Union{Int,Nothing}
     return token, expires_at
 end
 
-function validate_api_jwt(token::String)
+function validate_api_jwt(token::AbstractString)
     try
-        encoding = JSONWebTokens.HS256(JWT_SECRET)
-        claims = JSONWebTokens.decode(encoding, token)
+        token_s = String(token)
 
-        # JWT exp check
-        if Float64(claims["exp"]) < time()
+        encoding = JSONWebTokens.HS256(JWT_SECRET)
+        claims = JSONWebTokens.decode(encoding, token_s)
+
+        if haskey(claims, "exp") && Float64(claims["exp"]) < time()
             return nothing
         end
         if get(claims, "type", "") != "api_access"
             return nothing
         end
 
-        # DB authoritative for revocation + optional DB expiry
-        db_info = validate_token_in_db(token)
-        if db_info === nothing
-            return nothing
-        end
+        db_info = validate_token_in_db(token_s)
+        db_info === nothing && return nothing
 
-        return merge(claims, db_info)
-    catch e
-        @error "JWT validation failed" exception=e
+        return merge(Dict{String,Any}(pairs(claims)), db_info)
+    catch
         return nothing
     end
+end
+
+
+function validate_token_in_db(token::AbstractString)
+    token_s = String(token)
+    token_hash = hash_token(token_s)
+
+    result = execute(DB_CONN, """
+        SELECT client_id, client_name, expires_at, active
+        FROM api_tokens
+        WHERE token_hash = \$1
+    """, [token_hash])
+
+    LibPQ.num_rows(result) == 0 && return nothing
+
+    data = columntable(result)
+    client_id   = String(data.client_id[1])
+    client_name = String(data.client_name[1])
+    expires_at  = data.expires_at[1]
+    active      = data.active[1]
+
+    active == true || return nothing
+
+    if !(ismissing(expires_at) || expires_at === nothing)
+        if expires_at < utcnow()
+            return nothing
+        end
+    end
+
+
+    execute(DB_CONN, "UPDATE api_tokens SET last_used_at = NOW() WHERE token_hash = \$1", [token_hash])
+
+    return Dict("client_id" => client_id, "client_name" => client_name)
 end
 
 ####################################
@@ -446,21 +494,23 @@ function JWTAuthMiddleware(handler)
                 "Content-Type" => "application/json",
                 "X-RateLimit-Limit" => string(RATE_LIMIT_MAX_REQUESTS),
                 "X-RateLimit-Remaining" => "0",
-                "X-RateLimit-Reset" => string(Int(time() + window)),
-                "Retry-After" => string(Int(window))
+                "X-RateLimit-Reset" => string(floor(Int, time() + window)),
+                "Retry-After" => string(floor(Int, window))
             ], JSON3.write(Dict(
                 "error" => "rate_limit_exceeded",
-                "error_description" => "Too many requests."
+                "error_description" => "Too many requests. Limit: $RATE_LIMIT_MAX_REQUESTS per $(Int(window)) seconds"
             )))
         end
 
         ip = get_client_ip(req)
-        merge_context!(req, Dict(
-            "client_id" => client_id,
-            "client_name" => client_name,
-            "ip_address" => ip,
-            "authenticated" => true
+
+        merge_context!(req, Dict{Symbol,Any}(
+            :client_id => client_id,
+            :client_name => client_name,
+            :ip_address => ip,
+            :authenticated => true
         ))
+
 
         resp = handler(req)
 
@@ -468,9 +518,10 @@ function JWTAuthMiddleware(handler)
             push!(resp.headers,
                 "X-RateLimit-Limit" => string(RATE_LIMIT_MAX_REQUESTS),
                 "X-RateLimit-Remaining" => string(remaining),
-                "X-RateLimit-Reset" => string(Int(time() + window))
+                "X-RateLimit-Reset" => string(floor(Int, time() + window))
             )
         end
+
 
         status = resp isa HTTP.Response ? resp.status : 200
         @async log_token_usage(client_id, req.target, req.method, status, ip)
