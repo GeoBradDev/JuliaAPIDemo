@@ -1,11 +1,6 @@
-# Project.toml
-name = "JWTAPIServer"
-version = "1.0.0"
+name = "JuliaAPIAuth"
+uuid = "c3f2f4e8-9d64-4d2b-bd9f-8c44d3c9a001"
+version = "0.1.0"
 
-[deps]
-Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
-HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
-JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
-LibPQ = "194296ae-ab2e-5f79-8cd4-7183a0a5a0d1"
-Oxygen = "df9a0d86-3283-4b70-90e4-8ac3d0d3b1b7"
-SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
+[compat]
+julia = "1.10"

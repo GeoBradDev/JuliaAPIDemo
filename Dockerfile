@@ -1,33 +1,40 @@
-# Dockerfile
-FROM julia:1.10
+# syntax=docker/dockerfile:1.5
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    postgresql-client \
-    curl \
+FROM julia:1.10 AS builder
+
+# System deps for native libs (LibPQ, etc.)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates git build-essential pkg-config libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
 WORKDIR /app
 
-# Copy project files
-COPY Project.toml .
+# Copy only dependency files first for better layer caching
+COPY Project.toml ./
 
-# Install Julia dependencies
-RUN julia -e 'using Pkg; Pkg.activate("."); Pkg.instantiate(); Pkg.precompile()'
+# Generate Manifest.toml and install dependencies
+RUN julia --project=/app -e 'using Pkg; \
+        Pkg.add(["HTTP", "JSON3", "StructTypes", "Oxygen", "LibPQ", "JSONWebTokens"]); \
+        Pkg.instantiate()'
 
-# Install JWT package from GitHub (not in General registry yet)
-RUN julia -e 'using Pkg; Pkg.activate("."); Pkg.add(url="https://github.com/felipenoris/JSONWebTokens.jl"); Pkg.precompile()'
+# Now copy the app code
+COPY api.jl ./
 
-# Copy application code
-COPY api.jl .
+FROM julia:1.10
 
-# Expose port
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy pre-built depot and app
+COPY --from=builder /root/.julia /root/.julia
+COPY --from=builder /app /app
+
 EXPOSE 8080
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
+HEALTHCHECK --interval=30s --timeout=3s --start-period=40s \
+  CMD curl -f http://localhost:8080/health || exit 1
 
-# Run the application
-CMD ["julia", "api.jl"]
+CMD ["julia", "--project=/app", "api.jl"]
